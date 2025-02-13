@@ -3,6 +3,7 @@ import os
 import time
 from typing import TYPE_CHECKING, Literal
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import wandb
@@ -63,12 +64,49 @@ class Config(BaseConfig):
     optim: OptimConfig = OptimConfig()
     train: TrainConfig
 
+    svd_log_freq: int | None = None
+
 
 @dataclass
 class TrainingProgress:
     total_tokens: int
     outer_step: int
     step: int
+
+
+def log_grad_svd_metrics(name, singular_values, step, prefix="grad_svd"):
+    # Convert to numpy and sort
+    sv = singular_values.cpu().numpy()
+    sorted_vals = np.sort(np.abs(sv))[::-1]
+    total_magnitude = np.sum(np.abs(sorted_vals))
+
+    # Calculate metrics
+    metrics = {}
+
+    # Add inverse eigenvalue metrics
+    inv_sorted_vals = 1 / sorted_vals
+    inv_total = np.sum(inv_sorted_vals)
+
+    real_rank = len(sorted_vals)
+    effective_rank = np.exp(-np.sum((sorted_vals / total_magnitude) * np.log(sorted_vals / total_magnitude)))
+    inv_effective_rank = np.exp(-np.sum((inv_sorted_vals / inv_total) * np.log(inv_sorted_vals / inv_total)))
+
+    metrics.update(
+        {
+            f"{prefix}/{name}/effective_rank": effective_rank,
+            f"{prefix}/{name}/inv_effective_rank": inv_effective_rank,
+            f"{prefix}/{name}/compression_ratio": effective_rank / real_rank,
+            f"{prefix}/{name}/inv_compression_ratio": inv_effective_rank / real_rank,
+        }
+    )
+
+    # Add heatmap data
+    metrics[f"{prefix}/{name}/spectrum_hist"] = wandb.Histogram(sv, num_bins=100)
+    metrics[f"{prefix}/{name}/spectrum_raw"] = sv
+    # Add step
+    metrics["step"] = step
+
+    return metrics
 
 
 def train(config: Config):
@@ -177,6 +215,16 @@ def train(config: Config):
             # Launch both allreduces at the same time to hide latency
             dist.all_reduce(tensor=loss_batch, op=dist.ReduceOp.AVG)
 
+        if config.svd_log_freq is not None and training_progress.step % config.svd_log_freq == 0:
+            for name, param in model.named_parameters():
+                if param.grad is not None and len(param.grad.shape) == 2:
+                    _svd_u, svd_s, _svd_v = torch.svd(param.grad)
+                    metrics = log_grad_svd_metrics(
+                        name, svd_s, step=training_progress.step, prefix="pre_reduce_grad_svd"
+                    )
+                    if world_info.rank == 0 and config.wandb:
+                        wandb.log(metrics)
+
         jobs = []
         for param in model.parameters():
             jobs.append(dist.all_reduce(tensor=param.grad, op=dist.ReduceOp.AVG, async_op=True))
@@ -185,6 +233,16 @@ def train(config: Config):
             job.wait()
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # type: ignore (is a dtensor)
+
+        if config.svd_log_freq is not None and training_progress.step % config.svd_log_freq == 0:
+            for name, param in model.named_parameters():
+                if param.grad is not None and len(param.grad.shape) == 2:
+                    _svd_u, svd_s, _svd_v = torch.svd(param.grad)
+                    metrics = log_grad_svd_metrics(
+                        name, svd_s, step=training_progress.step, prefix="post_reduce_grad_svd"
+                    )
+                    if world_info.rank == 0 and config.wandb:
+                        wandb.log(metrics)
 
         optimizer.step()
         scheduler.step()
