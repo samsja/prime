@@ -190,7 +190,7 @@ def train(config: Config):
         loss_batch = 0
 
         for grad_acc_step in range(gradient_accumulation_steps):
-            # is_accumulating = grad_acc_step < gradient_accumulation_steps - 1
+            # is_accumulating = grad_acc_step < gradient_accumulation_steps - 1 #
 
             batch = next(train_dataloader_iterator)
             input_ids = batch["input_ids"].to("cuda")
