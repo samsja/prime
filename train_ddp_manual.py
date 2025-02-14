@@ -219,11 +219,11 @@ def train(config: Config):
             for name, param in model.named_parameters():
                 if param.grad is not None and len(param.grad.shape) == 2:
                     _svd_u, svd_s, _svd_v = torch.svd(param.grad)
-                    metrics = log_grad_svd_metrics(
+                    metrics_pre = log_grad_svd_metrics(
                         name, svd_s, step=training_progress.step, prefix="pre_reduce_grad_svd"
                     )
-                    if world_info.rank == 0 and config.wandb:
-                        wandb.log(metrics)
+        else:
+            metrics_pre = {}
 
         jobs = []
         for param in model.parameters():
@@ -238,11 +238,9 @@ def train(config: Config):
             for name, param in model.named_parameters():
                 if param.grad is not None and len(param.grad.shape) == 2:
                     _svd_u, svd_s, _svd_v = torch.svd(param.grad)
-                    metrics = log_grad_svd_metrics(
+                    metrics_post = log_grad_svd_metrics(
                         name, svd_s, step=training_progress.step, prefix="post_reduce_grad_svd"
                     )
-                    if world_info.rank == 0 and config.wandb:
-                        wandb.log(metrics)
 
         optimizer.step()
         scheduler.step()
@@ -267,6 +265,8 @@ def train(config: Config):
             "time": time.time(),
             "grad_norm": grad_norm.item(),
         }
+        metrics.update(metrics_pre)
+        metrics.update(metrics_post)
 
         log = f"step: {training_progress.step}, loss: {loss_batch.item():.4f}"
 
