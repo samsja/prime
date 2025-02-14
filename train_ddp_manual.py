@@ -76,34 +76,6 @@ def zeropower_via_svd(G, steps=None):
     return U @ V.T
 
 
-@torch.compile
-def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' \sim Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
-    """
-    assert len(G.shape) == 2
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16() / (G.norm() + eps)  # ensure top singular value <= 1
-    if G.size(0) > G.size(1):
-        X = X.T
-    for _ in range(steps):
-        A = X @ X.T
-        B = A @ X
-        X = a * X + b * B + c * A @ B
-    if G.size(0) > G.size(1):
-        X = X.T
-    return X.to(G.dtype)
-
-
-zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
-
-
 class Muon(torch.optim.Optimizer):
     """
     Muon: MomentUm Orthogonalized by Newton-schulz
@@ -130,15 +102,14 @@ class Muon(torch.optim.Optimizer):
         backend_steps: The number of iteration steps to use in the backend, if it is iterative.
     """
 
-    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, backend="newtonschulz5", backend_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov)
         super().__init__(params, defaults)
 
     def step(self):
         for group in self.param_groups:
             lr = group["lr"]
             momentum = group["momentum"]
-            zeropower_backend = zeropower_backends[group["backend"]]
             for p in group["params"]:
                 g = p.grad
                 if g is None:
@@ -151,10 +122,10 @@ class Muon(torch.optim.Optimizer):
                 if group["nesterov"]:
                     g = g.add(buf, alpha=momentum)
                 if g.size(0) == 3 * g.size(1):  # split grouped QKV parameters
-                    g = torch.cat([zeropower_backend(g1, steps=group["backend_steps"]) for g1 in g.split(g.size(1))])
+                    g = torch.cat([zeropower_via_svd(g1, steps=group["backend_steps"]) for g1 in g.split(g.size(1))])
                     scale = g.size(1) ** 0.5
                 else:
-                    g = zeropower_backend(g, steps=group["backend_steps"])
+                    g = zeropower_via_svd(g)
                     scale = max(g.size(0), g.size(1)) ** 0.5  # scale to have update.square().mean() == 1
                 p.data.add_(g, alpha=-lr * scale)
 
@@ -228,7 +199,6 @@ def train(config: Config):
         lr=config.optim.optim.lr,
         momentum=0.95,
         nesterov=True,
-        backend="svd",
     )
 
     optimizers = [optimizer2, optimizer1]
