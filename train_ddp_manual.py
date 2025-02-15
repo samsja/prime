@@ -64,6 +64,7 @@ class Config(BaseConfig):
     train: TrainConfig
 
     svd_low_rank: int | None = None
+    svd_warmup_steps: int = 500
 
 
 @dataclass
@@ -192,7 +193,7 @@ def train(config: Config):
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # type: ignore (is a dtensor)
 
-        if config.svd_low_rank is not None:
+        if config.svd_low_rank is not None and training_progress.step > config.svd_warmup_steps:
             for param, error in zip(param_2d, error_2d):
                 grad = param.grad + error
                 U, S, V = torch.svd(grad)
