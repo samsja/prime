@@ -63,6 +63,8 @@ class Config(BaseConfig):
     optim: OptimConfig = OptimConfig()
     train: TrainConfig
 
+    svd_low_rank: int | None = None
+
 
 @dataclass
 class TrainingProgress:
@@ -148,6 +150,10 @@ def train(config: Config):
 
     perf_counter = PerfCounter(window_size=10)
 
+    param_2d = [p for n, p in model.named_parameters() if p.dim() == 2]
+    error_2d = [torch.zeros_like(p) for p in param_2d] if config.svd_low_rank is not None else None
+    # param_rest = [p for n, p in model.named_parameters() if p.dim() != 2]
+
     while True:
         loss_batch = 0
 
@@ -185,6 +191,16 @@ def train(config: Config):
             job.wait()
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # type: ignore (is a dtensor)
+
+        if config.svd_low_rank is not None:
+            for param, error in zip(param_2d, error_2d):
+                grad = param.grad + error
+                U, S, V = torch.svd(grad)
+                low_rank_grad = (
+                    U[:, : config.svd_low_rank] * S[: config.svd_low_rank].unsqueeze(-1) @ V[:, : config.svd_low_rank].T
+                )
+                error.copy_(low_rank_grad - grad)
+                param.grad = low_rank_grad
 
         optimizer.step()
         scheduler.step()
