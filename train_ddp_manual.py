@@ -198,7 +198,7 @@ def train(config: Config):
                 grad = param.grad + error
                 U, S, V = torch.svd(grad)
                 low_rank_grad = (
-                    U[:, : config.svd_low_rank] * S[: config.svd_low_rank].unsqueeze(-1) @ V[:, : config.svd_low_rank].T
+                    U[:, : config.svd_low_rank] @ torch.diag(S[: config.svd_low_rank]) @ V[:, : config.svd_low_rank].T
                 )
                 error.copy_(low_rank_grad - grad)
                 param.grad = low_rank_grad
