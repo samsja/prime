@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import os
 import time
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Iterator, Literal
 
 import torch
 import torch.distributed as dist
@@ -74,118 +74,153 @@ class TrainingProgress:
     step: int
 
 
-@torch.compile
-def _orthogonalize_gram_schmidt(matrices, epsilon=0):
-    """
-    Apply Gram-Schmidt procedure to orthogonalize a batch of matrices.
-
-    If epsilon is 0, this is equivalent to `torch.qr(matrices, out=(matrices, _))`,
-    """
-    num_cols = matrices.shape[2]
-    for i in range(num_cols):
-        # Normalize the i'th column.
-        col = matrices[:, :, i : i + 1]
-        # If no epsilon is added here, division by zero may be caused by vanishing gradients.
-        # This epsilon is not needed if the input batch of matrices covers the gradients of at least one entire layer
-        # in the neural network.
-        if epsilon == 0:
-            # Note that col ** 2 can underflow/overflow if we use FP16.
-            # May need to consider multiplying a scaling factor and dividing it later, or using bfloat16 instead.
-            try:
-                col /= torch.norm(col, dim=1, keepdim=True)
-            except ZeroDivisionError:
-                # logger.error(
-                #     "The matrices to be orthogonalized has at least a column of all 0s. Please set a small value such as 1e-8 "
-                #     "as `orthogonalization_epsilon` in PowerSGD state."
-                # )
-                # Recover the values from NaNs to 0s.
-                col.fill_(0.0)
-        else:
-            col /= torch.norm(col, dim=1, keepdim=True) + epsilon
-        # Project it on the rest and remove it.
-        if i + 1 < num_cols:
-            rest = matrices[:, :, i + 1 :]
-            rest -= torch.sum(col * rest, dim=1, keepdim=True) * col
-
-
 class PowerSGD:
     def __init__(
-        self, params: list[torch.nn.Parameter], rank: int, warmup_steps: int, min_compression_rate: float = 2.0
+        self,
+        params: Iterator[torch.nn.Parameter],
+        rank=1,
+        min_compression_rate=2,
+        use_error_feedback=True,
+        orthogonalization_epsilon=0,
+        random_seed=0,
+        start_powersgd_iter=10,  # Wait this many iterations before starting compression
     ):
-        self.params = list(params)
+        self.params = list(params)  # Convert iterator to list to reuse
         self.rank = rank
-        self.warmup_steps = warmup_steps
         self.min_compression_rate = min_compression_rate
+        self.use_error_feedback = use_error_feedback
+        self.orthogonalization_epsilon = orthogonalization_epsilon
+        self.start_powersgd_iter = start_powersgd_iter
+        self.current_iter = 0
 
-        # Separate parameters based on compression criteria
-        self.no_compress_param = []
-        self.low_rank_param = []
+        # For error feedback - one per parameter
+        self.errors = [None for _ in self.params]
 
-        for param in self.params:
-            if len(param.shape) != 2:
-                self.no_compress_param.append(param)
-                continue
+        # For warm start - one pair per parameter
+        self.p_memories = [None for _ in self.params]
+        self.q_memories = [None for _ in self.params]
 
-            # Check if the parameter should be compressed using the same rule
-            n, m = param.shape
-            matrix_approximation_rank = min(n, m, self.rank)
-            uncompressed_size = n * m
-            compressed_size = (n + m) * matrix_approximation_rank
+        # RNG for consistent random initialization across processes
+        self.rng = torch.Generator(device="cuda")  # Change device to cuda
+        self.rng.manual_seed(random_seed)
 
-            if compressed_size * self.min_compression_rate < uncompressed_size:
-                self.low_rank_param.append(param)
-            else:
-                self.no_compress_param.append(param)
+        # Stats tracking
+        self.total_numel_before_compression = 0
+        self.total_numel_after_compression = 0
 
-        # Initialize and orthogonalize Q matrices
-        self.q = [torch.randn(param.shape[1], self.rank).to(param.device) for param in self.low_rank_param]
-        for q in self.q:
-            q_batch = q.unsqueeze(0)  # Add batch dimension for orthogonalization
-            _orthogonalize_gram_schmidt(q_batch)
-            q.copy_(q_batch.squeeze(0))  # Update q with orthogonalized version
+    def should_compress(self, tensor):
+        """Determine if tensor should be compressed based on compression rate."""
+        # During warmup, don't compress
+        if self.current_iter < self.start_powersgd_iter:
+            return False
 
-        self.error = [torch.zeros_like(param).to(param.device) for param in self.low_rank_param]
+        matrix = tensor.view(tensor.shape[0], -1)
+        n, m = matrix.shape
+        rank = min(n, m, self.rank)
 
-        print(f"Compressible parameters: {len(self.low_rank_param)=}, {len(self.no_compress_param)=}")
-
-    def _should_compress(self, n: int, m: int, matrix_approximation_rank: int) -> bool:
-        """Determine if a matrix of given dimensions should be compressed."""
         uncompressed_size = n * m
-        compressed_size = (n + m) * matrix_approximation_rank
+        compressed_size = (n + m) * rank
+
         return compressed_size * self.min_compression_rate < uncompressed_size
 
-    def all_reduce(self, step: int):
-        # Always perform regular all_reduce for non-compressible parameters
-        for param in self.no_compress_param:
-            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+    def orthogonalize(self, matrix):
+        """Apply Gram-Schmidt orthogonalization."""
+        num_cols = matrix.shape[2]
+        for i in range(num_cols):
+            # Normalize the i'th column
+            col = matrix[:, :, i : i + 1]
+            col.div_(torch.norm(col, dim=1, keepdim=True) + self.orthogonalization_epsilon)
 
-        # During warmup, treat low-rank parameters as regular parameters
-        if step < self.warmup_steps:
-            for param in self.low_rank_param:
-                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-        else:
-            # Apply PowerSGD compression for compressible parameters
-            for param, q, error in zip(self.low_rank_param, self.q, self.error):
-                delta = param.grad + error
+            # Project it on the rest and remove it
+            if i + 1 < num_cols:
+                rest = matrix[:, :, i + 1 :]
+                rest.sub_(torch.sum(col * rest, dim=1, keepdim=True) * col)
 
-                # Compress and decompress
-                P = delta @ q  # n×r matrix
-                dist.all_reduce(P, op=dist.ReduceOp.AVG)
+    def compress_decompress(self, tensor, index):
+        """Compress and decompress a tensor using PowerSGD."""
+        original_shape = tensor.shape
+        matrix = tensor.view(tensor.shape[0], -1)
+        n, m = matrix.shape
+        rank = min(n, m, self.rank)
 
-                # Orthogonalize P after all-reduce
-                P = P.unsqueeze(0)
-                _orthogonalize_gram_schmidt(P)
-                P = P.squeeze(0)
+        # Update compression stats
+        self.total_numel_before_compression += n * m
+        self.total_numel_after_compression += (n + m) * rank
 
-                # Compute Q and reconstruct gradients
-                Q = delta.T @ P  # m×r matrix
-                dist.all_reduce(Q, op=dist.ReduceOp.AVG)
-                Q.div_(dist.get_world_size())
+        # Handle error feedback
+        if self.use_error_feedback and self.errors[index] is not None:
+            matrix += self.errors[index].view(n, m)
 
-                # Update gradient with reconstructed value
-                reconstructed_grad = P @ Q.T
-                error.copy_(delta - reconstructed_grad)
-                param.grad = reconstructed_grad
+        # Keep copy for error feedback
+        original_matrix = matrix.clone() if self.use_error_feedback else None
+
+        # Initialize Q if not warm starting
+        if self.q_memories[index] is None:
+            self.q_memories[index] = torch.randn(
+                (1, m, rank), generator=self.rng, device=tensor.device, dtype=tensor.dtype
+            ).to(tensor.device)
+
+        # Initialize P
+        if self.p_memories[index] is None:
+            self.p_memories[index] = torch.empty((1, n, rank), device=tensor.device, dtype=tensor.dtype).to(
+                tensor.device
+            )
+
+        # Orthogonalize Q
+        self.orthogonalize(self.q_memories[index])
+
+        # Compute P = MQ
+        torch.bmm(matrix.unsqueeze(0), self.q_memories[index], out=self.p_memories[index])
+
+        # Allreduce P
+        dist.all_reduce(self.p_memories[index])
+
+        # Orthogonalize P
+        self.orthogonalize(self.p_memories[index])
+
+        # Compute Q = M^TP
+        torch.bmm(matrix.t().unsqueeze(0), self.p_memories[index], out=self.q_memories[index])
+
+        # Allreduce Q
+        dist.all_reduce(self.q_memories[index])
+        self.q_memories[index].div_(dist.get_world_size())
+
+        # Compute M ≈ PQ^T
+        torch.bmm(self.p_memories[index], self.q_memories[index].transpose(1, 2), out=matrix.unsqueeze(0))
+        matrix = matrix.squeeze(0)
+
+        # Update error for error feedback
+        if self.use_error_feedback:
+            self.errors[index] = original_matrix - matrix
+
+        return matrix.view(original_shape)
+
+    def step(self):
+        """Compress gradients of all parameters and perform allreduce."""
+        with torch.no_grad():
+            for i, param in enumerate(self.params):
+                if param.grad is not None:
+                    if self.should_compress(param.grad):
+                        param.grad.data = self.compress_decompress(param.grad.data, i)
+                    else:
+                        # For small tensors or during warmup, just do regular allreduce
+                        dist.all_reduce(param.grad.data)
+                        param.grad.data.div_(dist.get_world_size())
+
+        # Increment iteration counter
+        self.current_iter += 1
+
+        # Print compression stats periodically
+        if self.current_iter % 100 == 0 and self.current_iter >= self.start_powersgd_iter:
+            compression_rate = (
+                self.total_numel_before_compression / self.total_numel_after_compression
+                if self.total_numel_after_compression > 0
+                else 0
+            )
+            print(f"Iteration {self.current_iter}")
+            print(f"Compression rate: {compression_rate:.2f}x")
+            print(f"Total elements before compression: {self.total_numel_before_compression}")
+            print(f"Total elements after compression: {self.total_numel_after_compression}")
 
 
 def train(config: Config):
@@ -266,7 +301,7 @@ def train(config: Config):
     perf_counter = PerfCounter(window_size=10)
 
     power_sgd = (
-        PowerSGD(model.parameters(), config.svd_low_rank, config.svd_warmup_steps)
+        PowerSGD(model.parameters(), config.svd_low_rank, start_powersgd_iter=config.svd_warmup_steps)
         if config.svd_low_rank is not None
         else None
     )
@@ -300,7 +335,7 @@ def train(config: Config):
             # Launch both allreduces at the same time to hide latency
             dist.all_reduce(tensor=loss_batch, op=dist.ReduceOp.AVG)
 
-        power_sgd.all_reduce(training_progress.step)
+        power_sgd.step()
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # type: ignore (is a dtensor)
 
