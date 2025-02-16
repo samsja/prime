@@ -137,8 +137,13 @@ class PowerSGD:
             else:
                 self.no_compress_param.append(param)
 
-        # Initialize Q matrices and error buffers only for compressible parameters
+        # Initialize and orthogonalize Q matrices
         self.q = [torch.randn(param.shape[1], self.rank).to(param.device) for param in self.low_rank_param]
+        for q in self.q:
+            q_batch = q.unsqueeze(0)  # Add batch dimension for orthogonalization
+            _orthogonalize_gram_schmidt(q_batch)
+            q.copy_(q_batch.squeeze(0))  # Update q with orthogonalized version
+
         self.error = [torch.zeros_like(param).to(param.device) for param in self.low_rank_param]
 
         print(f"Compressible parameters: {len(self.low_rank_param)=}, {len(self.no_compress_param)=}")
@@ -167,19 +172,20 @@ class PowerSGD:
                 P = delta @ q  # n×r matrix
                 dist.all_reduce(P, op=dist.ReduceOp.AVG)
 
-                # Orthogonalize P
+                # Orthogonalize P after all-reduce
                 P = P.unsqueeze(0)
                 _orthogonalize_gram_schmidt(P)
                 P = P.squeeze(0)
 
                 # Compute Q and reconstruct gradients
-                Q = param.grad.T @ P  # m×r matrix
+                Q = delta.T @ P  # m×r matrix
                 dist.all_reduce(Q, op=dist.ReduceOp.AVG)
+                Q.div_(dist.get_world_size())
 
                 # Update gradient with reconstructed value
                 reconstructed_grad = P @ Q.T
-                error.copy_(delta - reconstructed_grad)  # Compute error after reconstruction
-                param.grad = reconstructed_grad  # Set the gradient to the reconstructed value
+                error.copy_(delta - reconstructed_grad)
+                param.grad = reconstructed_grad
 
 
 def train(config: Config):
