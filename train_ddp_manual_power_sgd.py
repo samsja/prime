@@ -141,6 +141,8 @@ class PowerSGD:
         self.q = [torch.randn(param.shape[1], self.rank).to(param.device) for param in self.low_rank_param]
         self.error = [torch.zeros_like(param).to(param.device) for param in self.low_rank_param]
 
+        print(f"Compressible parameters: {len(self.low_rank_param)=}, {len(self.no_compress_param)=}")
+
     def _should_compress(self, n: int, m: int, matrix_approximation_rank: int) -> bool:
         """Determine if a matrix of given dimensions should be compressed."""
         uncompressed_size = n * m
@@ -165,9 +167,6 @@ class PowerSGD:
                 P = delta @ q  # n×r matrix
                 dist.all_reduce(P, op=dist.ReduceOp.AVG)
 
-                # Update error
-                error.copy_(delta - P @ q.T)
-
                 # Orthogonalize P
                 P = P.unsqueeze(0)
                 _orthogonalize_gram_schmidt(P)
@@ -176,6 +175,11 @@ class PowerSGD:
                 # Compute Q and reconstruct gradients
                 Q = param.grad.T @ P  # m×r matrix
                 dist.all_reduce(Q, op=dist.ReduceOp.AVG)
+
+                # Update gradient with reconstructed value
+                reconstructed_grad = P @ Q.T
+                error.copy_(delta - reconstructed_grad)  # Compute error after reconstruction
+                param.grad = reconstructed_grad  # Set the gradient to the reconstructed value
 
 
 def train(config: Config):
