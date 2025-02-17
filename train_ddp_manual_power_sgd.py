@@ -124,17 +124,21 @@ class PowerSGD:
         return compressed_size * self.min_compression_rate < uncompressed_size
 
     def orthogonalize(self, matrix):
-        """Apply Gram-Schmidt orthogonalization."""
-        num_cols = matrix.shape[2]
-        for i in range(num_cols):
-            # Normalize the i'th column
-            col = matrix[:, :, i : i + 1]
-            col.div_(torch.norm(col, dim=1, keepdim=True) + self.orthogonalization_epsilon)
-
-            # Project it on the rest and remove it
-            if i + 1 < num_cols:
-                rest = matrix[:, :, i + 1 :]
-                rest.sub_(torch.sum(col * rest, dim=1, keepdim=True) * col)
+        """Apply QR factorization for rank>2, Gram-Schmidt for rank<=2 or half precision."""
+        rank = matrix.shape[2]
+        if rank <= 2 or matrix.dtype in [torch.float16, torch.bfloat16]:
+            # Original Gram-Schmidt code
+            for i in range(rank):
+                col = matrix[:, :, i : i + 1]
+                col.div_(torch.norm(col, dim=1, keepdim=True) + self.orthogonalization_epsilon)
+                if i + 1 < rank:
+                    rest = matrix[:, :, i + 1 :]
+                    rest.sub_(torch.sum(col * rest, dim=1, keepdim=True) * col)
+        else:
+            # QR factorization
+            torch.linalg.qr(
+                matrix, out=(matrix, torch.empty(matrix.shape[0], rank, rank, device=matrix.device, dtype=matrix.dtype))
+            )
 
     def compress_decompress(self, tensor, index):
         """Compress and decompress a tensor using PowerSGD."""
