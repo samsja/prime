@@ -66,6 +66,8 @@ class Config(BaseConfig):
     svd_low_rank: int | None = None
     svd_warmup_steps: int = 0
 
+    power_sgd_backend: Literal["qr", "svd"] = "qr"
+
 
 @dataclass
 class TrainingProgress:
@@ -227,6 +229,127 @@ class PowerSGD:
             print(f"Total elements after compression: {self.total_numel_after_compression}")
 
 
+class SVDCompressor:
+    def __init__(
+        self,
+        params: Iterator[torch.nn.Parameter],
+        rank=1,
+        min_compression_rate=2,
+        use_error_feedback=True,
+        random_seed=0,
+        start_compression_iter=10,
+    ):
+        self.params = list(params)
+        self.rank = rank
+        self.min_compression_rate = min_compression_rate
+        self.use_error_feedback = use_error_feedback
+        self.start_compression_iter = start_compression_iter
+        self.current_iter = 0
+
+        # For error feedback - one per parameter
+        self.errors = [None for _ in self.params]
+
+        # Stats tracking
+        self.total_numel_before_compression = 0
+        self.total_numel_after_compression = 0
+
+    def should_compress(self, tensor):
+        """Determine if tensor should be compressed based on compression rate."""
+        if self.current_iter < self.start_compression_iter:
+            return False
+
+        matrix = tensor.view(tensor.shape[0], -1)
+        n, m = matrix.shape
+        rank = min(n, m, self.rank)
+
+        uncompressed_size = n * m
+        compressed_size = (n + m) * rank
+
+        return compressed_size * self.min_compression_rate < uncompressed_size
+
+    def compress_decompress(self, tensor, index):
+        """Compress and decompress a tensor using truncated SVD."""
+        original_shape = tensor.shape
+        matrix = tensor.view(tensor.shape[0], -1)
+        n, m = matrix.shape
+        rank = min(n, m, self.rank)
+
+        # Update compression stats
+        self.total_numel_before_compression += n * m
+        self.total_numel_after_compression += (n + m) * rank
+
+        # Handle error feedback
+        if self.use_error_feedback and self.errors[index] is not None:
+            matrix += self.errors[index].view(n, m)
+
+        # Keep copy for error feedback
+        original_matrix = matrix.clone() if self.use_error_feedback else None
+
+        # Compute SVD
+        try:
+            U, S, Vt = torch.linalg.svd(matrix, full_matrices=False)
+
+            # Take top rank components
+            U_k = U[:, :rank]
+            S_k = S[:rank]
+            Vt_k = Vt[:rank, :]
+
+            # Create P and Q factors
+            P = U_k * S_k.view(1, -1)  # Scale U by singular values
+            Q = Vt_k.t()  # Transpose of top singular vectors
+
+            # Reshape for all_reduce
+            P = P.unsqueeze(0)
+            Q = Q.unsqueeze(0)
+
+            # Allreduce P and Q
+            dist.all_reduce(P)
+            dist.all_reduce(Q)
+            Q.div_(dist.get_world_size())
+
+            # Compute reconstruction
+            torch.bmm(P, Q.transpose(1, 2), out=matrix.unsqueeze(0))
+            matrix = matrix.squeeze(0)
+
+        except RuntimeError:
+            # Fallback for numerical instability
+            dist.all_reduce(matrix)
+            matrix.div_(dist.get_world_size())
+
+        # Update error for error feedback
+        if self.use_error_feedback:
+            self.errors[index] = original_matrix - matrix
+
+        return matrix.view(original_shape)
+
+    def step(self):
+        """Compress gradients of all parameters and perform allreduce."""
+        with torch.no_grad():
+            for i, param in enumerate(self.params):
+                if param.grad is not None:
+                    if self.should_compress(param.grad):
+                        param.grad.data = self.compress_decompress(param.grad.data, i)
+                    else:
+                        # For small tensors or during warmup, just do regular allreduce
+                        dist.all_reduce(param.grad.data)
+                        param.grad.data.div_(dist.get_world_size())
+
+        # Increment iteration counter
+        self.current_iter += 1
+
+        # Print compression stats periodically
+        if self.current_iter % 100 == 0 and self.current_iter >= self.start_compression_iter:
+            compression_rate = (
+                self.total_numel_before_compression / self.total_numel_after_compression
+                if self.total_numel_after_compression > 0
+                else 0
+            )
+            print(f"Iteration {self.current_iter}")
+            print(f"Compression rate: {compression_rate:.2f}x")
+            print(f"Total elements before compression: {self.total_numel_before_compression}")
+            print(f"Total elements after compression: {self.total_numel_after_compression}")
+
+
 def train(config: Config):
     # batch_size is the total batch size for all GPUs
     assert config.optim.batch_size % world_info.local_world_size == 0
@@ -304,11 +427,15 @@ def train(config: Config):
 
     perf_counter = PerfCounter(window_size=10)
 
-    power_sgd = (
-        PowerSGD(model.parameters(), config.svd_low_rank, start_powersgd_iter=config.svd_warmup_steps)
-        if config.svd_low_rank is not None
-        else None
-    )
+    if config.svd_low_rank is not None:
+        if config.power_sgd_backend == "qr":
+            power_sgd = PowerSGD(model.parameters(), config.svd_low_rank, start_powersgd_iter=config.svd_warmup_steps)
+        else:
+            power_sgd = SVDCompressor(
+                model.parameters(), config.svd_low_rank, start_compression_iter=config.svd_warmup_steps
+            )
+    else:
+        power_sgd = None
 
     while True:
         loss_batch = 0
