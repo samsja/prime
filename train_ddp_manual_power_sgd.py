@@ -294,9 +294,8 @@ class SVDCompressor:
             S_k = S[:rank]
             Vt_k = Vt[:rank, :]
 
-            # Create P and Q factors
-            P = U_k * S_k.view(1, -1)  # Scale U by singular values
-            Q = Vt_k.t()  # Transpose of top singular vectors
+            P = (U_k * S_k.view(1, -1)).unsqueeze(0).contiguous()  # Scale U by singular values
+            Q = Vt_k.t().unsqueeze(0).contiguous()  # Transpose of top singular vectors
 
             # Reshape for all_reduce
             P = P.unsqueeze(0)
