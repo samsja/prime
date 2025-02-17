@@ -53,6 +53,7 @@ class TrainConfig(BaseConfig):
     ac_ckpt: bool | int = False
     reshard_after_forward: bool = True  # old shard grad op True mean full shard
     torch_compile: bool = True
+    gradient_as_bucket_view: bool = True
 
 
 class Config(BaseConfig):
@@ -130,7 +131,12 @@ def train(config: Config):
         apply_ac_ckpt(model, num)
 
     logger.info(f"Initializing DDP model on device {world_info.local_rank}")
-    model = DDP(model, device_ids=[world_info.local_rank], broadcast_buffers=False, gradient_as_bucket_view=True)
+    model = DDP(
+        model,
+        device_ids=[world_info.local_rank],
+        broadcast_buffers=False,
+        gradient_as_bucket_view=config.train.gradient_as_bucket_view,
+    )
 
     if config.svd_low_rank is not None:
         state = powerSGD_hook.PowerSGDState(
