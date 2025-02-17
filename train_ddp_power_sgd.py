@@ -231,6 +231,11 @@ def train(config: Config):
             metrics["mfu"] = 100 * num_flop_per_token * tokens_per_second / gpu_peak_flops / world_info.local_world_size
             log += f", tokens_per_second: {tokens_per_second:.2f}, mfu: {metrics['mfu']:.2f}"
 
+        if config.svd_low_rank is not None:
+            ratio, _, _ = state.compression_stats()
+            metrics.update({"compression/ratio": ratio})
+            log += f", compression/ratio: {ratio:.2f}"
+
         if world_info.rank == 0 and config.wandb:
             wandb.log(metrics)
 
