@@ -294,12 +294,8 @@ class SVDCompressor:
             S_k = S[:rank]
             Vt_k = Vt[:rank, :]
 
-            P = (U_k * S_k.view(1, -1)).unsqueeze(0).contiguous()  # Scale U by singular values
-            Q = Vt_k.t().unsqueeze(0).contiguous()  # Transpose of top singular vectors
-
-            # Reshape for all_reduce
-            P = P.unsqueeze(0)
-            Q = Q.unsqueeze(0)
+            P = (U_k * S_k.view(1, -1)).contiguous()  # Scale U by singular values
+            Q = Vt_k.t().contiguous()  # Transpose of top singular vectors
 
             # Allreduce P and Q
             dist.all_reduce(P)
@@ -307,7 +303,7 @@ class SVDCompressor:
             Q.div_(dist.get_world_size())
 
             # Compute reconstruction
-            torch.bmm(P, Q.transpose(1, 2), out=matrix.unsqueeze(0))
+            torch.bmm(P.unsqueeze(0), Q.t().unsqueeze(0), out=matrix.unsqueeze(0))
             matrix = matrix.squeeze(0)
 
         except RuntimeError:
