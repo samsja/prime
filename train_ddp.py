@@ -332,7 +332,7 @@ def train(config: Config):
 
         # logging
         training_progress.step += 1
-        inner_lr = [group["lr"] for group in optimizer.param_groups][0]
+        inner_lr = [group["lr"] for group in optimizers[0].param_groups][0]
 
         # syncing loss across all data parallel rank within a nodes
         new_tokens = config.data.seq_length * config.optim.batch_size
