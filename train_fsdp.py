@@ -11,7 +11,6 @@ import wandb
 from zeroband.data import TEST_VOCAB_SIZE, DataConfig, get_dataloader
 from zeroband.lr_scheduler import get_scheduler
 from zeroband.models.llama import get_model
-from zeroband.models.llama.model import create_block_mask_from_seqlens
 from zeroband.muon import Muon
 from zeroband.utils import (
     FakeTokenizer,
@@ -188,9 +187,9 @@ def train(config: Config):
             batch = next(train_dataloader_iterator)
             input_ids = batch["input_ids"].to("cuda")
             labels = batch["labels"].to("cuda")
-            seqlens = [seqlen.to("cuda") for seqlen in batch["seqlens"]]
-            block_mask = create_block_mask_from_seqlens(seqlens) if seqlens is not None else None
-
+            # seqlens = [seqlen.to("cuda") for seqlen in batch["seqlens"]]
+            # block_mask = create_block_mask_from_seqlens(seqlens) if seqlens is not None else None
+            block_mask = None
             logits = model(tokens=input_ids, block_mask=block_mask).contiguous()
             flatten_logits = logits.reshape(-1, logits.size(-1))  # b seq vocab -> (b * seq) vocab
             flatten_labels = labels.reshape(-1)  # b seq -> (b * seq)
