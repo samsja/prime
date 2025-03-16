@@ -12,6 +12,7 @@ from zeroband.data import TEST_VOCAB_SIZE, DataConfig, get_dataloader
 from zeroband.lr_scheduler import get_scheduler
 from zeroband.models.llama import get_model
 from zeroband.models.llama.model import create_block_mask_from_seqlens
+from zeroband.muon import Muon
 from zeroband.utils import (
     FakeTokenizer,
     PerfCounter,
@@ -29,16 +30,16 @@ import torch.nn.functional as F
 from zeroband.world_info import get_world_info
 
 
-class AdamConfig(BaseConfig):
-    type: Literal["adam"] = "adam"
-    lr: float = 4e-4
-    weight_decay: float = 0.1
-    betas1: float = 0.9
-    betas2: float = 0.95
+class MuonConfig(BaseConfig):
+    type: Literal["muon"] = "muon"
+    lr: float = 2e-2
+    wd: float = 0
+    beta: float = 0.95
+    ns_steps: int = 5
 
 
 class OptimConfig(BaseConfig):
-    optim: AdamConfig = AdamConfig()
+    optim: MuonConfig = MuonConfig()
     sched_type: Literal["cosine", "linear", "wsd-sqrt"] = "cosine"
     warmup_steps: int = 1000
     stable_steps: int = 80_000
@@ -133,20 +134,38 @@ def train(config: Config):
         fully_shard(transformer_block, mp_policy=mp_policy, reshard_after_forward=reshard_after_forward)
     fully_shard(model, mp_policy=mp_policy, reshard_after_forward=config.train.reshard_after_forward)
 
-    optimizer = torch.optim.AdamW(
-        params=model.parameters(),
+    hidden_matrix_params = [p for n, p in model.layers.named_parameters() if p.ndim >= 2 and "embed" not in n]
+    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+    scalar_params = [p for p in model.parameters() if p.ndim < 2]
+    head_params = [model.output.weight]
+
+    # init the optimizer(s)
+    adam_params = [
+        dict(params=head_params, lr=0.008),
+        dict(params=embed_params, lr=0.6),
+        dict(params=scalar_params, lr=0.04),
+    ]
+    optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
+    optimizer2 = Muon(
+        hidden_matrix_params,
         lr=config.optim.optim.lr,
-        weight_decay=config.optim.optim.weight_decay,
-        betas=(config.optim.optim.betas1, config.optim.optim.betas2),
+        beta=config.optim.optim.beta,
+        ns_steps=config.optim.optim.ns_steps,
+        wd=config.optim.optim.wd,
     )
 
-    scheduler = get_scheduler(
-        sched_type=config.optim.sched_type,
-        optimizer=optimizer,
-        num_warmup_steps=config.optim.warmup_steps,
-        num_stable_steps=config.optim.stable_steps,
-        num_training_steps=config.optim.total_steps,
-    )
+    optimizers = [optimizer2, optimizer1]
+
+    schedulers = [
+        get_scheduler(
+            sched_type=config.optim.sched_type,
+            optimizer=optimizer,
+            num_warmup_steps=config.optim.warmup_steps,
+            num_stable_steps=config.optim.stable_steps,
+            num_training_steps=config.optim.total_steps,
+        )
+        for optimizer in optimizers
+    ]
 
     training_progress = TrainingProgress(total_tokens=0, outer_step=0, step=0)
 
@@ -191,14 +210,15 @@ def train(config: Config):
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).full_tensor()  # type: ignore (is a dtensor)
 
-        optimizer.step()
-        scheduler.step()
+        for optimizer, scheduler in zip(optimizers, schedulers):
+            optimizer.step()
+            scheduler.step()
 
-        optimizer.zero_grad()
+            optimizer.zero_grad()
 
         # logging
         training_progress.step += 1
-        inner_lr = [group["lr"] for group in optimizer.param_groups][0]
+        inner_lr = [group["lr"] for group in optimizers[0].param_groups][0]
 
         # syncing loss across all data parallel rank within a nodes
         new_tokens = config.data.seq_length * config.optim.batch_size
