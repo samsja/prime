@@ -10,7 +10,7 @@ from collections import deque
 import torch
 from torch.optim.optimizer import ParamsT
 from torch.distributed.tensor import DTensor, Replicate, Shard
-
+from torch.distributed import gather
 
 @torch.compile(fullgraph=True)
 def nsloop_torch(X: torch.Tensor, steps: int, *, a=3.4445, b=-4.7750, c=2.0315):
@@ -127,11 +127,20 @@ class Muon(torch.optim.Optimizer):
         for group in self.param_groups:
             for p, g, m in self.filter_group(group):
                 spec = g._spec
-                g = g.redistribute(placements=[Replicate()] * self.mesh.ndim, async_op=True)
-                if i % ws == r:
-                    g = zeropower_via_newtonschulz(g, steps=group["ns_steps"])
-                    g = g.view_as(p).type_as(p)
-
+                dest_rank = i  % ws
+                if dest_rank == r:
+                    gather_lists = [torch.zeros_like(g.to_local()) for _ in range(ws)]
+                    print(f"gather_lists: {len(gather_lists)}, {[gather_lists[i].shape for i in range(ws)]}")
+                    gather(g.to_local(), gather_lists, dst=dest_rank, async_op=True) 
+                    g_full_block = torch.cat(gather_lists, dim=0)
+                    g_full_block.copy_(zeropower_via_newtonschulz(g_full_block, steps=group["ns_steps"]))
+                    g = g_full_block.view_as(p).type_as(p)
+                else:
+                    
+                    g_local = g.to_local()
+                    print(f"g_local: {g_local.shape}")
+                    gather(g_local, None, dst=dest_rank, async_op=True)
+                    
                 dq.append([p, g, spec, group["lr"], i % ws])
                 if len(dq) > prefetch_factor:
                     deferred_work(*dq.popleft())
