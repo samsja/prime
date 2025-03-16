@@ -10,7 +10,7 @@ from collections import deque
 import torch
 from torch.optim.optimizer import ParamsT
 from torch.distributed.tensor import DTensor, Replicate, Shard
-from torch.distributed import gather
+from torch.distributed import gather, scatter
 
 @torch.compile(fullgraph=True)
 def nsloop_torch(X: torch.Tensor, steps: int, *, a=3.4445, b=-4.7750, c=2.0315):
@@ -115,10 +115,14 @@ class Muon(torch.optim.Optimizer):
 
         dq = deque()
 
-        def deferred_work(p, g, spec, lr, src):
-            self.mesh.get_group(0).broadcast(g.to_local(), src).wait()
-            g = g.redistribute(placements=spec.placements, async_op=True)
+        def deferred_work(p, g, g_full_block, spec, lr, src_rank, rank):
+            if rank == src_rank:
+                chunks = list(g_full_block.chunk(ws, dim=0))
+                scatter(g.to_local(), chunks, src=src_rank, async_op=True)
+            else:
+                scatter(g.to_local(), None, src=src_rank, async_op=True) 
 
+       
             # update parameter with NS'd grad
             lr_scale = max(1, p.size(-2) / p.size(-1)) ** 0.5
             p.add_(g, alpha=-lr * lr_scale)
@@ -130,18 +134,17 @@ class Muon(torch.optim.Optimizer):
                 dest_rank = i  % ws
                 if dest_rank == r:
                     gather_lists = [torch.zeros_like(g.to_local()) for _ in range(ws)]
-                    print(f"gather_lists: {len(gather_lists)}, {[gather_lists[i].shape for i in range(ws)]}")
                     gather(g.to_local(), gather_lists, dst=dest_rank, async_op=True) 
                     g_full_block = torch.cat(gather_lists, dim=0)
                     g_full_block.copy_(zeropower_via_newtonschulz(g_full_block, steps=group["ns_steps"]))
-                    g = g_full_block.view_as(p).type_as(p)
+                    g_full_block = g_full_block.view_as(p).type_as(p)
                 else:
                     
                     g_local = g.to_local()
-                    print(f"g_local: {g_local.shape}")
                     gather(g_local, None, dst=dest_rank, async_op=True)
+                    g_full_block = None
                     
-                dq.append([p, g, spec, group["lr"], i % ws])
+                dq.append([p, g, g_full_block, spec, group["lr"], dest_rank, r])
                 if len(dq) > prefetch_factor:
                     deferred_work(*dq.popleft())
                 i += 1
