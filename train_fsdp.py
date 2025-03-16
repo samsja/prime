@@ -205,7 +205,7 @@ def train(config: Config):
             loss.backward()
             loss_batch += loss.detach().clone()
 
-            # Launch both allreduces at the same time to hide latency
+
         dist.all_reduce(tensor=loss_batch, op=dist.ReduceOp.AVG)
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0).full_tensor()  # type: ignore (is a dtensor)
